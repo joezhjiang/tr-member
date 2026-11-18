@@ -1,0 +1,23 @@
+{
+  "name": "tr-member",
+  "version": "0.1.0",
+  "private": true,
+  "description": "会员系统后端：会员档案、等级权益、订阅续费、积分与成长值",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage"
+  },
+  "keywords": [
+    "membership",
+    "subscription",
+    "points",
+    "benefits"
+  ],
+  "license": "UNLICENSED"
+}
