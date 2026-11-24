@@ -40,7 +40,8 @@ export function createSubscriptionService(ctx) {
     subscription.renewalCount += 1;
     subscription.lastOrderId = order.id;
     subscription.status = 'active';
-    if (order.autoRenew !== undefined) subscription.autoRenew = Boolean(order.autoRenew);
+    // 仅在调用方显式提供 autoRenew 时覆盖，避免普通顺延静默关闭自动续费（AC-05.5）
+    if (typeof order.autoRenew === 'boolean') subscription.autoRenew = order.autoRenew;
     subscription.updatedAt = now();
     return subscription;
   }
@@ -74,7 +75,7 @@ export function createSubscriptionService(ctx) {
           status: 'active',
           startAt: timestamp,
           endAt: addMonthsIso(timestamp, plan.periodMonths),
-          autoRenew: Boolean(order.autoRenew),
+          autoRenew: order.autoRenew === true,
           sourceOrderId: order.id,
           lastOrderId: order.id,
           renewalCount: 0,

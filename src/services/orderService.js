@@ -54,7 +54,8 @@ export function createOrderService(ctx) {
     const plan = catalog.getPlan(planId);
     if (!plan.active) throw new ConflictError('PLAN_INACTIVE', '该套餐已下架', { planId });
 
-    const autoRenew = optionalBoolean(body, 'autoRenew', { fallback: false });
+    // 未提供 autoRenew 时保持 null，与「显式 false」区分，避免顺延时静默关闭自动续费（AC-05.5）
+    const autoRenew = optionalBoolean(body, 'autoRenew', { fallback: undefined });
     const timestamp = now();
     const order = {
       id: newId('ord'),
@@ -64,7 +65,7 @@ export function createOrderService(ctx) {
       status: 'pending',
       amountCents: plan.priceCents,
       currency: plan.currency,
-      autoRenew,
+      autoRenew: autoRenew ?? null,
       subscriptionId: null,
       renewalOfSubscriptionId: null,
       growthAwarded: 0,
@@ -108,17 +109,20 @@ export function createOrderService(ctx) {
 
   /**
    * 支付确认（支付回调 / 管理端代付 / 自动续费）：
-   * 幂等——已支付订单重复调用直接返回原结果；其余非 pending 状态一律拒绝。
+   * 会员状态是权限前置条件，先于订单状态与幂等重放判定；
+   * 已支付订单重复调用直接返回原结果，其余非 pending 状态一律拒绝。
    */
   function pay(order, { source = 'callback' } = {}) {
+    const { members } = services();
+    const member = members.get(order.memberId);
+    members.requireActive(member);
+
     if (order.status === 'paid') return { order, idempotent: true, subscription: null, action: 'none' };
     if (order.status !== 'pending') {
       throw new ConflictError('ORDER_NOT_PAYABLE', '订单当前状态不可支付', { orderId: order.id, status: order.status });
     }
 
-    const { members, catalog, subscriptions, points, benefits } = services();
-    const member = members.get(order.memberId);
-    members.requireActive(member);
+    const { catalog, subscriptions, points, benefits } = services();
     const plan = catalog.getPlan(order.planId);
     const timestamp = now();
 

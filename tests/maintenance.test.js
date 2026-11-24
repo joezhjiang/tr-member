@@ -39,6 +39,42 @@ test('开启自动续费的订阅到期后自动扣款顺延', async (t) => {
   assert.equal(profile.body.member.pointsBalance, 200);
 });
 
+test('同一时间点连续执行维护任务不会重复扣款或重复补发权益', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+
+  const member = await api.registerMember({ email: 'maint-idempotent@example.com' });
+  const memberId = member.body.member.id;
+  const token = member.body.token;
+  await api.buyPlan(memberId, token, 'plan_silver_monthly', { autoRenew: true });
+  api.advanceMonths(1);
+
+  const first = await api.request('POST', '/api/admin/maintenance/run', { admin: true });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.renewedSubscriptions, 1);
+  assert.equal(first.body.renewalOrderIds.length, 1);
+  assert.ok(first.body.expiredBenefitGrants >= 1, '跨月时旧月授权应在首次 run 中过期');
+
+  const orderCountAfterFirst = api.app.ctx.db.orders.length;
+  const grantCountAfterFirst = api.app.ctx.db.benefitGrants.length;
+
+  const second = await api.request('POST', '/api/admin/maintenance/run', { admin: true });
+  assert.equal(second.status, 200);
+  assert.equal(second.body.renewedSubscriptions, 0);
+  assert.deepEqual(second.body.renewalOrderIds, []);
+  assert.equal(second.body.skippedAutoRenew, 0);
+  assert.equal(second.body.expiredSubscriptions, 0);
+  assert.equal(second.body.expiredBenefitGrants, 0);
+  assert.equal(second.body.grantedBenefitGrants, 0);
+  assert.equal(api.app.ctx.db.orders.length, orderCountAfterFirst);
+  assert.equal(api.app.ctx.db.benefitGrants.length, grantCountAfterFirst);
+
+  const orders = await api.request('GET', `/api/members/${memberId}/orders`, { token });
+  assert.equal(orders.body.items.filter((order) => order.kind === 'renewal').length, 1);
+  const subscriptions = await api.request('GET', `/api/members/${memberId}/subscriptions`, { token });
+  assert.equal(subscriptions.body.items[0].renewalCount, 1);
+});
+
 test('未开启自动续费的订阅到期后置为过期并回落等级', async (t) => {
   const api = await startApi();
   t.after(() => api.close());

@@ -125,6 +125,155 @@ test('跨月由维护任务补发月度权益，旧月额度失效', async (t) =
   assert.equal(shipping.remaining, 4);
 });
 
+test('同月配额下调不回收已发额度，次月按新配额发放', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+
+  const member = await api.registerMember({ email: 'downgrade@example.com' });
+  const memberId = member.body.member.id;
+  const token = member.body.token;
+  await api.buyPlan(memberId, token, 'plan_gold_yearly');
+  await api.request('POST', `/api/members/${memberId}/benefits/free_shipping/consume`, {
+    body: { quantity: 3 },
+    token,
+  });
+
+  const lowered = await api.request('PUT', '/api/admin/tiers/gold/benefits', {
+    body: { benefits: [{ benefitCode: 'free_shipping', quota: 4, period: 'monthly' }] },
+    admin: true,
+  });
+  assert.equal(lowered.status, 200);
+
+  const sameMonth = await api.request('GET', `/api/members/${memberId}/benefits`, { token });
+  const shippingBefore = sameMonth.body.items.find((item) => item.code === 'free_shipping');
+  assert.equal(shippingBefore.periodKey, '2026-03');
+  assert.equal(shippingBefore.quota, 10);
+  assert.equal(shippingBefore.remaining, 7, '同月降级不应回收已发额度');
+
+  api.advanceMonths(1);
+  const run = await api.request('POST', '/api/admin/maintenance/run', { admin: true });
+  assert.equal(run.status, 200);
+  assert.ok(run.body.grantedBenefitGrants >= 1);
+
+  const nextMonth = await api.request('GET', `/api/members/${memberId}/benefits`, { token });
+  const shippingAfter = nextMonth.body.items.find((item) => item.code === 'free_shipping');
+  assert.equal(shippingAfter.periodKey, '2026-04');
+  assert.equal(shippingAfter.quota, 4);
+  assert.equal(shippingAfter.remaining, 4, '次月应按新配额重新发放');
+});
+
+test('退款回收来源权益后，下一次查询按剩余等级重算且不返还已消耗额度', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+
+  const member = await api.registerMember({ email: 'revoke-recompute@example.com' });
+  const memberId = member.body.member.id;
+  const token = member.body.token;
+  // 成长值 2600（黄金）+ 铂金月卡（付费等级更高）→ 生效等级铂金，权益归属该订阅
+  const silver = await api.buyPlan(memberId, token, 'plan_silver_yearly');
+  const platinum = await api.buyPlan(memberId, token, 'plan_platinum_monthly');
+
+  const before = await api.request('GET', `/api/members/${memberId}/benefits`, { token });
+  assert.equal(before.body.tier.code, 'platinum');
+  assert.equal(before.body.tier.source, 'subscription');
+  const platinumGrant = api.app.ctx.db.benefitGrants.find(
+    (grant) => grant.benefitCode === 'free_shipping' && grant.status === 'active',
+  );
+  assert.equal(platinumGrant.quota, 30);
+  assert.equal(platinumGrant.sourceSubscriptionId, platinum.subscription.id);
+
+  await api.request('POST', `/api/members/${memberId}/benefits/free_shipping/consume`, { body: { quantity: 3 }, token });
+
+  const refunded = await api.request('POST', `/api/admin/orders/${platinum.order.id}/refund`, { admin: true });
+  assert.equal(refunded.status, 200);
+  assert.ok(refunded.body.revokedGrants > 0);
+  assert.equal(refunded.body.cancelledSubscription.id, platinum.subscription.id);
+
+  const afterRefund = await api.request('GET', `/api/members/${memberId}/benefits`, { token });
+  assert.equal(afterRefund.body.tier.code, 'gold', '成长值 2600 仍满足黄金等级');
+  assert.equal(afterRefund.body.tier.source, 'growth');
+  const shipping = afterRefund.body.items.find((item) => item.code === 'free_shipping');
+  assert.equal(shipping.quota, 10);
+  assert.equal(shipping.used, 3, '已消耗的 3 次必须在重算后保留');
+  assert.equal(shipping.remaining, 7, '重算按「当前配额 - 当月已核销量」，不得重发满额');
+
+  const activeGrants = api.app.ctx.db.benefitGrants.filter(
+    (grant) => grant.benefitCode === 'free_shipping' && grant.status === 'active',
+  );
+  assert.equal(activeGrants.length, 1);
+  assert.equal(activeGrants[0].source, 'tier', '成长值来源的权益不得挂在订阅上');
+  assert.equal(activeGrants[0].sourceSubscriptionId, null);
+  assert.notEqual(activeGrants[0].id, platinumGrant.id);
+
+  // 防护：当月合计只能核销 10 次（3 + 7），第 11 次必须被拒
+  const seven = await api.request('POST', `/api/members/${memberId}/benefits/free_shipping/consume`, {
+    body: { quantity: 7 },
+    token,
+  });
+  assert.equal(seven.status, 200);
+  assert.equal(seven.body.remaining, 0);
+
+  const extra = await api.request('POST', `/api/members/${memberId}/benefits/free_shipping/consume`, { body: {}, token });
+  assert.equal(extra.status, 409);
+  assert.equal(extra.body.error.code, 'BENEFIT_EXHAUSTED');
+});
+
+test('退款回收后维护任务重算同样保留已消耗额度', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+
+  const member = await api.registerMember({ email: 'revoke-maintenance@example.com' });
+  const memberId = member.body.member.id;
+  const token = member.body.token;
+  await api.buyPlan(memberId, token, 'plan_silver_yearly');
+  const platinum = await api.buyPlan(memberId, token, 'plan_platinum_monthly');
+  await api.request('POST', `/api/members/${memberId}/benefits/free_shipping/consume`, { body: { quantity: 2 }, token });
+
+  const refunded = await api.request('POST', `/api/admin/orders/${platinum.order.id}/refund`, { admin: true });
+  assert.equal(refunded.status, 200);
+  assert.ok(refunded.body.revokedGrants > 0);
+
+  const run = await api.request('POST', '/api/admin/maintenance/run', { admin: true });
+  assert.equal(run.status, 200);
+  assert.ok(run.body.grantedBenefitGrants >= 1);
+
+  const benefits = await api.request('GET', `/api/members/${memberId}/benefits`, { token });
+  assert.equal(benefits.body.tier.code, 'gold');
+  const shipping = benefits.body.items.find((item) => item.code === 'free_shipping');
+  assert.equal(shipping.quota, 10);
+  assert.equal(shipping.used, 2);
+  assert.equal(shipping.remaining, 8, '维护任务重算同样不得返还已消耗额度');
+  assert.ok(benefits.body.items.every((item) => item.remaining >= 0));
+});
+
+test('成长值等级生效时，退订低等级订阅不会回收权益', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+
+  const member = await api.registerMember({ email: 'growth-source@example.com' });
+  const memberId = member.body.member.id;
+  const token = member.body.token;
+  // 白银年卡成长值 2600 → 成长值等级黄金（rank 2）高于白银订阅（rank 1），权益来源为成长值
+  const silver = await api.buyPlan(memberId, token, 'plan_silver_yearly');
+
+  const before = await api.request('GET', `/api/members/${memberId}/benefits`, { token });
+  assert.equal(before.body.tier.code, 'gold');
+  assert.equal(before.body.tier.source, 'growth');
+  assert.equal(before.body.items.find((item) => item.code === 'free_shipping').quota, 10);
+
+  const cancelled = await api.request('POST', `/api/subscriptions/${silver.subscription.id}/cancel`, { token });
+  assert.equal(cancelled.status, 200);
+  assert.equal(cancelled.body.revokedGrants, 0, '权益来自成长值等级，退订订阅不得回收');
+
+  const after = await api.request('GET', `/api/members/${memberId}/benefits`, { token });
+  assert.equal(after.body.tier.code, 'gold');
+  assert.equal(after.body.tier.source, 'growth');
+  const shipping = after.body.items.find((item) => item.code === 'free_shipping');
+  assert.equal(shipping.quota, 10);
+  assert.equal(shipping.remaining, 10);
+  assert.equal(shipping.used, 0);
+});
+
 test('等级目录可被管理员调整，权益变更立即生效', async (t) => {
   const api = await startApi();
   t.after(() => api.close());
