@@ -6,18 +6,26 @@ const MAX_BODY_BYTES = 1_048_576;
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let failed = false;
     const chunks = [];
     req.on('data', (chunk) => {
+      if (failed) return;
       size += chunk.length;
       if (size > MAX_BODY_BYTES) {
+        failed = true;
         reject(new AppError(413, 'PAYLOAD_TOO_LARGE', '请求体超过 1MB 限制'));
-        req.destroy();
+        // 丢弃剩余数据但不销毁请求，确保 413 响应能完整写回客户端。
+        req.resume();
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
+    req.on('end', () => {
+      if (!failed) resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on('error', (error) => {
+      if (!failed) reject(error);
+    });
   });
 }
 
@@ -100,7 +108,7 @@ export function createHandler({ router, ctx }) {
           error: {
             code: error.code,
             message: error.message,
-            details: error.details,
+            details: error.details ?? null,
             requestId,
           },
         });
@@ -108,7 +116,7 @@ export function createHandler({ router, ctx }) {
       }
       console.error(`[${requestId}] 未处理异常`, error);
       sendJson(res, 500, {
-        error: { code: 'INTERNAL_ERROR', message: '服务内部错误', requestId },
+        error: { code: 'INTERNAL_ERROR', message: '服务内部错误', details: null, requestId },
       });
     }
   };

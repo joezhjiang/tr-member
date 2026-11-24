@@ -10,9 +10,45 @@ export function createBenefitService(ctx) {
   const defOf = (code) => db.benefitDefs.find((def) => def.code === code) ?? null;
   const rulesOfTier = (tierCode) => db.benefitRules.filter((rule) => rule.tierCode === tierCode);
   const grantsOf = (memberId) => db.benefitGrants.filter((grant) => grant.memberId === memberId);
+  const usagesOf = () => (Array.isArray(db.benefitUsages) ? db.benefitUsages : []);
 
   function isValid(grant, timestamp) {
     return grant.status === 'active' && grant.remaining > 0 && (grant.validUntil === null || grant.validUntil > timestamp);
+  }
+
+  /** 展示口径：只要授权仍有效就计入配额，即使剩余为 0（否则已用完的额度会从 quota/used 中消失） */
+  function isReportable(grant, timestamp) {
+    return grant.status === 'active' && (grant.validUntil === null || grant.validUntil > timestamp);
+  }
+
+  /**
+   * 已核销量账本：以「会员 + 权益 + 周期 + periodKey」为维度记录真实消耗，
+   * 是回收后重算的唯一事实来源（AC-06.5 / D-13：已消耗额度不返还）。
+   */
+  function usedOf(memberId, benefitCode, period, periodKey) {
+    return usagesOf()
+      .filter(
+        (usage) =>
+          usage.memberId === memberId &&
+          usage.benefitCode === benefitCode &&
+          usage.period === period &&
+          usage.periodKey === periodKey,
+      )
+      .reduce((sum, usage) => sum + usage.quantity, 0);
+  }
+
+  function recordUsage(memberId, benefitCode, period, periodKey, quantity, timestamp) {
+    if (quantity <= 0) return;
+    if (!Array.isArray(db.benefitUsages)) db.benefitUsages = [];
+    db.benefitUsages.push({
+      id: newId('bus'),
+      memberId,
+      benefitCode,
+      period,
+      periodKey,
+      quantity,
+      consumedAt: timestamp,
+    });
   }
 
   function currentMembership(member) {
@@ -22,23 +58,34 @@ export function createBenefitService(ctx) {
   /**
    * 按会员当前生效等级补齐权益额度：
    * - 月度权益按自然月发放，同月内升级只补差额，不重复发放；
-   * - 终身权益每个会员只发一次，不随订阅到期回收。
+   * - 同月降级保留已发放额度（AC-06.7 / D-12），不再追扣；
+   * - 回收后重算按「当前配额 - 当月已核销量」计算剩余额度，已消耗额度不返还（AC-06.5 / D-13）；
+   * - 终身权益每个会员只发一次，不随订阅到期回收；
+   * - 权益归属（source / sourceSubscriptionId）只跟随生效等级的来源，成长值等级不得挂到订阅上（AC-03.2/05.4）。
    */
   function ensureGrants(member) {
     const timestamp = now();
-    const { tier, subscription } = currentMembership(member);
+    const { tier, entitlementSubscription } = currentMembership(member);
     const periodKey = monthKeyOf(timestamp);
     const monthEnd = endOfMonthIso(timestamp);
-    const sourceSubscriptionId = subscription?.id ?? null;
-    const source = subscription ? 'subscription' : 'tier';
+    const sourceSubscriptionId = entitlementSubscription?.id ?? null;
+    const source = entitlementSubscription ? 'subscription' : 'tier';
     let created = 0;
     let changed = false;
+
+    function attribute(grant) {
+      if (grant.source === source && grant.sourceSubscriptionId === sourceSubscriptionId) return false;
+      grant.source = source;
+      grant.sourceSubscriptionId = sourceSubscriptionId;
+      return true;
+    }
 
     for (const rule of rulesOfTier(tier.code)) {
       const def = defOf(rule.benefitCode);
       if (!def) continue;
 
       if (rule.period === 'monthly') {
+        const used = usedOf(member.id, rule.benefitCode, 'monthly', periodKey);
         const existing = grantsOf(member.id).find(
           (grant) =>
             grant.benefitCode === rule.benefitCode &&
@@ -55,11 +102,11 @@ export function createBenefitService(ctx) {
             period: 'monthly',
             periodKey,
             quota: rule.quota,
-            remaining: rule.quota,
+            remaining: Math.max(0, rule.quota - used),
             validFrom: timestamp,
             validUntil: monthEnd,
             status: 'active',
-            source: subscription ? 'subscription' : 'tier',
+            source,
             sourceSubscriptionId,
             createdAt: timestamp,
             updatedAt: timestamp,
@@ -67,20 +114,22 @@ export function createBenefitService(ctx) {
           created += 1;
           continue;
         }
-        // 同月升级：补齐配额差额，并把权益归属切到当前订阅，便于退订时精确回收
-        const diff = rule.quota - existing.quota;
-        if (diff > 0) {
+        // 同月升级：补齐到当前配额并按已核销量重算剩余；同月降级保留已发额度
+        if (rule.quota > existing.quota) {
           existing.quota = rule.quota;
-          existing.remaining += diff;
           existing.tierCode = tier.code;
-          existing.sourceSubscriptionId = sourceSubscriptionId;
-          existing.source = source;
+          existing.remaining = Math.max(0, rule.quota - used);
+          existing.updatedAt = timestamp;
+          changed = true;
+        }
+        if (attribute(existing)) {
           existing.updatedAt = timestamp;
           changed = true;
         }
         continue;
       }
 
+      const lifetimeUsed = usedOf(member.id, rule.benefitCode, 'lifetime', 'lifetime');
       const existingLifetime = grantsOf(member.id).find(
         (grant) => grant.benefitCode === rule.benefitCode && grant.period === 'lifetime' && grant.status === 'active',
       );
@@ -93,16 +142,21 @@ export function createBenefitService(ctx) {
           period: 'lifetime',
           periodKey: 'lifetime',
           quota: rule.quota,
-          remaining: rule.quota,
+          remaining: Math.max(0, rule.quota - lifetimeUsed),
           validFrom: timestamp,
           validUntil: null,
           status: 'active',
-          source: subscription ? 'subscription' : 'tier',
+          source,
           sourceSubscriptionId,
           createdAt: timestamp,
           updatedAt: timestamp,
         });
         created += 1;
+        continue;
+      }
+      if (attribute(existingLifetime)) {
+        existingLifetime.updatedAt = timestamp;
+        changed = true;
       }
     }
 
@@ -119,7 +173,7 @@ export function createBenefitService(ctx) {
       const def = defOf(rule.benefitCode);
       const grants = grantsOf(member.id).filter((grant) => {
         if (grant.benefitCode !== rule.benefitCode) return false;
-        if (!isValid(grant, timestamp)) return false;
+        if (!isReportable(grant, timestamp)) return false;
         return rule.period === 'monthly' ? grant.period === 'monthly' && grant.periodKey === periodKey : grant.period === 'lifetime';
       });
       const quota = grants.reduce((sum, grant) => sum + grant.quota, 0);
@@ -186,6 +240,8 @@ export function createBenefitService(ctx) {
       const used = Math.min(grant.remaining, left);
       grant.remaining -= used;
       grant.updatedAt = timestamp;
+      // 逐授权记录消耗，保证月度/终身额度分别可追溯（回收后重算依赖该账本）
+      recordUsage(member.id, benefitCode, grant.period, grant.periodKey, used, timestamp);
       left -= used;
     }
     persist();

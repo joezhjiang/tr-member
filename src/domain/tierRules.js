@@ -40,6 +40,10 @@ export function resolveMembership({ tiers, member, subscriptions, nowIso }) {
     tier: usePaid ? paidTier : growthTier,
     source: usePaid ? 'subscription' : 'growth',
     growthTier,
+    // 档案展示用的最高有效订阅摘要（AC-01.5），不代表权益来源
     subscription: paidSubscription,
+    // 权益归属来源：只有付费等级真正生效（usePaid）时才把权益挂到订阅上，
+    // 否则权益归属成长值等级，退订该订阅不得回收（AC-03.2/05.4/06.5）
+    entitlementSubscription: usePaid ? paidSubscription : null,
   };
 }

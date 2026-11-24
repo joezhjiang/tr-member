@@ -27,20 +27,41 @@ export function buildRouter(ctx) {
     return order;
   }
 
+  /**
+   * 会员本人发起的写操作必须走过状态闸门（AC-02.5 / 需求 §5.1）；
+   * 管理员代为执行的状态调整、退款等系统动作保持既有权限路径。
+   */
+  function assertMemberActive(actor, member) {
+    if (actor?.type === 'member') s().members.requireActive(member);
+  }
+
+  function pageOf(query, all) {
+    const { limit, offset } = paginationOf(query);
+    return { items: all.slice(offset, offset + limit), total: all.length, limit, offset };
+  }
+
   // ---------- 公开：元数据 ----------
   router.get('/health', () => ({ status: 200, body: { status: 'ok', now: ctx.now() } }), { auth: 'public' });
 
-  router.get('/api/tiers', () => ({ body: { items: s().catalog.listTiers() } }), { auth: 'public' });
+  router.get(
+    '/api/tiers',
+    ({ query }) => ({ body: pageOf(query, s().catalog.listTiers()) }),
+    { auth: 'public' },
+  );
 
   router.get(
     '/api/plans',
     ({ query }) => ({
-      body: { items: s().catalog.listPlans({ activeOnly: query.get('includeInactive') !== 'true' }) },
+      body: pageOf(query, s().catalog.listPlans({ activeOnly: query.get('includeInactive') !== 'true' })),
     }),
     { auth: 'public' },
   );
 
-  router.get('/api/benefits', () => ({ body: { items: s().catalog.listBenefitDefs() } }), { auth: 'public' });
+  router.get(
+    '/api/benefits',
+    ({ query }) => ({ body: pageOf(query, s().catalog.listBenefitDefs()) }),
+    { auth: 'public' },
+  );
 
   // ---------- 会员 ----------
   router.post(
@@ -65,17 +86,18 @@ export function buildRouter(ctx) {
     ({ params, actor }) => {
       assertOwner(actor, params.id);
       const member = s().members.get(params.id);
+      assertMemberActive(actor, member);
       return { body: { memberId: member.id, token: s().members.rotateToken(member) } };
     },
   );
 
   router.get(
     '/api/members/:id/subscriptions',
-    ({ params, actor }) => {
+    ({ params, actor, query }) => {
       assertOwner(actor, params.id);
       s().members.get(params.id);
       const items = s().subscriptions.listByMember(params.id).map((sub) => s().subscriptions.view(sub));
-      return { body: { items, total: items.length } };
+      return { body: pageOf(query, items) };
     },
   );
 
@@ -132,10 +154,11 @@ export function buildRouter(ctx) {
   // ---------- 订单与支付 ----------
   router.get(
     '/api/members/:id/orders',
-    ({ params, actor }) => {
+    ({ params, actor, query }) => {
       assertOwner(actor, params.id);
+      s().members.get(params.id);
       const items = s().orders.listByMember(params.id).map((order) => s().orders.view(order));
-      return { body: { items, total: items.length } };
+      return { body: pageOf(query, items) };
     },
   );
 
@@ -166,12 +189,14 @@ export function buildRouter(ctx) {
 
   router.post('/api/orders/:id/cancel', ({ params, actor }) => {
     const order = loadOwnedOrder(params.id, actor);
+    assertMemberActive(actor, s().members.get(order.memberId));
     return { body: { order: s().orders.view(s().orders.cancel(order)) } };
   });
 
   router.post('/api/subscriptions/:id/cancel', ({ params, actor, body }) => {
     const subscription = s().subscriptions.get(params.id);
     assertOwner(actor, subscription.memberId);
+    assertMemberActive(actor, s().members.get(subscription.memberId));
     const cancelled = s().subscriptions.cancel(subscription, { reason: body?.reason ?? null });
     const revokedGrants = s().benefits.revokeBySubscription(cancelled.id);
     return { body: { subscription: s().subscriptions.view(cancelled), revokedGrants } };

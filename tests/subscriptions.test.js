@@ -83,7 +83,7 @@ test('退款只回收可回收的积分，不产生负余额', async (t) => {
   assert.ok(ledger.body.items.every((entry) => entry.balanceAfter >= 0));
 });
 
-test('升级订单退款后按剩余订阅重新发放本月权益', async (t) => {
+test('升级订单退款后按剩余订阅重算本月权益，已消耗额度不返还', async (t) => {
   const api = await startApi();
   t.after(() => api.close());
 
@@ -106,7 +106,42 @@ test('升级订单退款后按剩余订阅重新发放本月权益', async (t) =
   assert.equal(afterRefund.body.tier.code, 'silver');
   const shipping = afterRefund.body.items.find((item) => item.code === 'free_shipping');
   assert.equal(shipping.quota, 4);
-  assert.equal(shipping.remaining, 4);
+  assert.equal(shipping.used, 4, '同月已核销的 4 次必须保留（AC-06.5）');
+  assert.equal(shipping.remaining, 0, '重算按「当前配额 - 已核销量」，不得重发满额');
+
+  const extra = await api.request('POST', `/api/members/${memberId}/benefits/free_shipping/consume`, { body: {}, token });
+  assert.equal(extra.status, 409);
+  assert.equal(extra.body.error.code, 'BENEFIT_EXHAUSTED');
+});
+
+test('普通顺延不会静默关闭自动续费，显式关闭仍然生效', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+
+  const member = await api.registerMember({ email: 'autorenew-extend@example.com' });
+  const memberId = member.body.member.id;
+  const token = member.body.token;
+
+  const first = await api.buyPlan(memberId, token, 'plan_silver_monthly', { autoRenew: true });
+  assert.equal(first.subscription.autoRenew, true);
+
+  // 普通顺延：未提供 autoRenew
+  const second = await api.buyPlan(memberId, token, 'plan_silver_monthly');
+  assert.equal(second.pay.body.action, 'extended');
+  assert.equal(second.subscription.autoRenew, true, '未提供 autoRenew 时不得关闭自动续费');
+  assert.equal(second.subscription.renewalCount, 1);
+
+  // 显式关闭仍然生效
+  const third = await api.buyPlan(memberId, token, 'plan_silver_monthly', { autoRenew: false });
+  assert.equal(third.pay.body.action, 'extended');
+  assert.equal(third.subscription.autoRenew, false);
+
+  // 关闭后到期不再自动扣款（三次顺延后到期时间在 3 个月后）
+  api.advanceMonths(3);
+  const run = await api.request('POST', '/api/admin/maintenance/run', { admin: true });
+  assert.equal(run.status, 200);
+  assert.equal(run.body.renewedSubscriptions, 0);
+  assert.equal(run.body.expiredSubscriptions, 1);
 });
 
 test('退款与退订需要正确权限', async (t) => {

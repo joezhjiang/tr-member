@@ -18,6 +18,7 @@ function createSeed() {
     subscriptions: [],
     pointEntries: [],
     benefitGrants: [],
+    benefitUsages: [],
   };
 }
 
